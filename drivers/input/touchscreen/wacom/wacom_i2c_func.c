@@ -178,18 +178,18 @@ int wacom_i2c_test(struct wacom_i2c *wac_i2c)
 
 	ret = i2c_master_send(wac_i2c->client, &buf, sizeof(buf));
 	if (ret > 0)
-		printk(KERN_INFO "[E-PEN]: buf:%d, sent:%d\n", buf, ret);
+		printk(KERN_INFO "[E-PEN] buf:%d, sent:%d\n", buf, ret);
 	else {
-		printk(KERN_ERR "[E-PEN]: Digitizer is not active\n");
+		printk(KERN_ERR "[E-PEN] Digitizer is not active\n");
 		return -1;
 	}
 
 	ret = i2c_master_recv(wac_i2c->client, test, sizeof(test));
 	if (ret >= 0) {
 		for (i = 0; i < 8; i++)
-			printk(KERN_INFO "[E-PEN]: %d\n", test[i]);
+			printk(KERN_INFO "[E-PEN] %d\n", test[i]);
 	} else {
-		printk(KERN_ERR "[E-PEN]: Digitizer does not reply\n");
+		printk(KERN_ERR "[E-PEN] Digitizer does not reply\n");
 		return -1;
 	}
 
@@ -281,6 +281,38 @@ int wacom_checksum(struct wacom_i2c *wac_i2c)
 
 	wac_i2c->checksum_result = (5 == i);
 
+#ifdef WACOM_CONNECTION_CHECK
+	buf[0] = WACOM_I2C_STOP;
+	if (1 == i2c_master_send(wac_i2c->client, buf, 1)) {
+		buf[0] = WACOM_I2C_GRID_CHECK;
+		if (1 == i2c_master_send(wac_i2c->client, buf, 1)) {
+			int cnt = 30;
+			buf[0] = WACOM_STATUS;
+			do {
+				msleep(50);
+				if (1 == i2c_master_send(wac_i2c->client,
+							buf, 1)) {
+					if (2 ==
+						i2c_master_recv(wac_i2c->client,
+								buf, 2)) {
+						if (0 != buf[0])
+							break;
+					}
+				}
+			} while (cnt--);
+
+			wac_i2c->connection_check = (1 == buf[0]);
+			printk(KERN_DEBUG
+			       "[E-PEN] epen_connection : %d, %d(%d)\n",
+			       buf[0], buf[1], cnt);
+		}
+
+		buf[0] = WACOM_I2C_STOP;
+		i2c_master_send(wac_i2c->client, buf, 1);
+		buf[0] = WACOM_I2C_START;
+		i2c_master_send(wac_i2c->client, buf, 1);
+	}
+#endif
 	return ret;
 }
 
@@ -289,10 +321,15 @@ int wacom_i2c_query(struct wacom_i2c *wac_i2c)
 	struct wacom_features *wac_feature = wac_i2c->wac_feature;
 	struct i2c_msg msg[2];
 	int ret;
-	char buf;
+	u8 buf;
 	u8 data[9] = {0, };
 	int i = 0;
 	int query_limit = 10;
+
+#if defined(CONFIG_MACH_P4NOTE)
+	buf = WACOM_I2C_STOP;
+	i2c_master_send(wac_i2c->client, &buf, 1);
+#endif
 
 	buf = COM_QUERY;
 
@@ -308,18 +345,16 @@ int wacom_i2c_query(struct wacom_i2c *wac_i2c)
 
 	for (i = 0; i < query_limit; i++) {
 		ret = i2c_transfer(wac_i2c->client->adapter, msg, 2);
-		printk(KERN_INFO "[E-PEN]: %s: %dth ret of wacom query=%d\n",
+		printk(KERN_INFO "[E-PEN] %s: %dth ret of wacom query=%d\n",
 		       __func__, i, ret);
 		if (2 == ret) {
 			wac_feature->fw_version =
 				((u16) data[7] << 8) + (u16) data[8];
-			if (wac_feature->fw_version != 0xFF
-			    && wac_feature->fw_version != 0xFFFF
-			    && wac_feature->fw_version != 0x0) {
+			if (0x0f == data[0]) {
 				break;
 			} else {
 				printk(KERN_NOTICE
-				       "[E-PEN]: %X, %X, %X, %X, %X, %X, %X, fw=0x%x\n",
+				       "[E-PEN] %X, %X, %X, %X, %X, %X, %X, fw=0x%x\n",
 				       data[0], data[1], data[2], data[3],
 				       data[4], data[5], data[6],
 				       wac_feature->fw_version);
@@ -340,29 +375,36 @@ int wacom_i2c_query(struct wacom_i2c *wac_i2c)
 
 #if defined(COOR_WORK_AROUND)
 	if (i == 10 || ret < 0) {
-		printk(KERN_NOTICE "[E-PEN]: COOR_WORK_AROUND is applied\n");
+		printk(KERN_NOTICE "[E-PEN] COOR_WORK_AROUND is applied\n");
 		printk(KERN_NOTICE
-		       "[E-PEN]: %X, %X, %X, %X, %X, %X, %X, %X, %X\n", data[0],
+		       "[E-PEN] %X, %X, %X, %X, %X, %X, %X, %X, %X\n", data[0],
 		       data[1], data[2], data[3], data[4], data[5], data[6],
 		       data[7], data[8]);
 		wac_feature->x_max = (u16) WACOM_MAX_COORD_X;
 		wac_feature->y_max = (u16) WACOM_MAX_COORD_Y;
 		wac_feature->pressure_max = (u16) WACOM_MAX_PRESSURE;
-#ifndef CONFIG_MACH_T0
+#ifdef CONFIG_MACH_T0
+		wac_feature->fw_version = 0;
+#else
 		wac_feature->fw_version = 0xFF;
 #endif
 	}
 #endif
 
-	printk(KERN_NOTICE "[E-PEN]: x_max=0x%X\n", wac_feature->x_max);
-	printk(KERN_NOTICE "[E-PEN]: y_max=0x%X\n", wac_feature->y_max);
-	printk(KERN_NOTICE "[E-PEN]: pressure_max=0x%X\n",
+	printk(KERN_NOTICE "[E-PEN] x_max=0x%X\n", wac_feature->x_max);
+	printk(KERN_NOTICE "[E-PEN] y_max=0x%X\n", wac_feature->y_max);
+	printk(KERN_NOTICE "[E-PEN] pressure_max=0x%X\n",
 	       wac_feature->pressure_max);
-	printk(KERN_NOTICE "[E-PEN]: fw_version=0x%X (d7:0x%X,d8:0x%X)\n",
+	printk(KERN_NOTICE "[E-PEN] fw_version=0x%X (d7:0x%X,d8:0x%X)\n",
 	       wac_feature->fw_version, data[7], data[8]);
-	printk(KERN_NOTICE "[E-PEN]: %X, %X, %X, %X, %X, %X, %X, %X, %X\n",
+	printk(KERN_NOTICE "[E-PEN] %X, %X, %X, %X, %X, %X, %X, %X, %X\n",
 	       data[0], data[1], data[2], data[3], data[4], data[5], data[6],
 	       data[7], data[8]);
+
+#if defined(CONFIG_MACH_P4NOTE)
+	buf = WACOM_I2C_START;
+	i2c_master_send(wac_i2c->client, &buf, 1);
+#endif
 
 	if ((i == 10) && (ret < 0))
 		return ret;
@@ -593,6 +635,8 @@ int wacom_i2c_coord(struct wacom_i2c *wac_i2c)
 			input_report_key(wac_i2c->input_dev, BTN_TOUCH, prox);
 			input_report_key(wac_i2c->input_dev, wac_i2c->tool, 1);
 			input_sync(wac_i2c->input_dev);
+			wac_i2c->last_x = x;
+			wac_i2c->last_y = y;
 
 			if (prox && !wac_i2c->pen_pressed) {
 #ifdef CONFIG_SEC_TOUCHSCREEN_DVFS_LOCK

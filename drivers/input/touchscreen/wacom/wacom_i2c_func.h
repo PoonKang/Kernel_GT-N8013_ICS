@@ -37,6 +37,11 @@ extern unsigned char screen_rotate;
 extern unsigned char user_hand;
 #endif
 
+#define WACOM_I2C_STOP		0x30
+#define WACOM_I2C_START		0x31
+#define WACOM_I2C_GRID_CHECK	0xC9
+#define WACOM_STATUS			0xD8
+
 extern int wacom_i2c_master_send(struct i2c_client *client, const char *buf,
 				 int count, unsigned short addr);
 extern int wacom_i2c_master_recv(struct i2c_client *client, char *buf,

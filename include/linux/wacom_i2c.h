@@ -33,6 +33,7 @@
 #define COM_COORD_NUM      7
 #define COM_QUERY_NUM      9
 
+#define COM_SAMPLERATE_STOP 0x30
 #define COM_SAMPLERATE_40  0x33
 #define COM_SAMPLERATE_80  0x32
 #define COM_SAMPLERATE_133 0x31
@@ -80,6 +81,7 @@
 #define SEC_BUS_LOCK
 #endif
 #define BATTERY_SAVING_MODE
+#define WACOM_CONNECTION_CHECK
 #define WACOM_HAVE_RESET_CONTROL 0
 #define WACOM_POSX_MAX 21866
 #define WACOM_POSY_MAX 13730
@@ -269,10 +271,11 @@ struct wacom_i2c {
 	struct device *bus_dev;
 #endif
 #ifdef CONFIG_MACH_P4NOTE
-	struct delayed_work query_work;
 	bool pen_type;
 #endif
-
+#ifdef WACOM_CONNECTION_CHECK
+	bool connection_check;
+#endif
 #ifdef BATTERY_SAVING_MODE
 	bool battery_saving_mode;
 #endif

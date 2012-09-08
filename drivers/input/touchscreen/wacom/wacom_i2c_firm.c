@@ -25,9 +25,9 @@ bool ums_binary;
 #if defined(CONFIG_MACH_P4NOTE)
 const unsigned int Binary_nLength = 0xBFFF;
 const unsigned char Mpu_type = 0x22;
-const unsigned int Firmware_version_of_file = 0x228;
+const unsigned int Firmware_version_of_file = 0x229;
 unsigned char *firmware_name = "";
-const char Firmware_checksum[] = { 0x1F, 0x25, 0x6A, 0x62, 0x69, };
+const char Firmware_checksum[] = { 0x1F, 0x32, 0xD4, 0xDC, 0x98, };
 
 #include "wacom_i2c_firm_p4.h"
 #elif defined(CONFIG_MACH_Q1_BD)
