@@ -593,7 +593,7 @@ int dhd_check_module_cid(dhd_pub_t *dhd)
 #ifdef BCM4334_CHIP
 		unsigned char semco_id[4] = {0x00, 0x00, 0x33, 0x33};
 		unsigned char semco_id_sh[4] = {0x00, 0x00, 0xFB, 0x50};	//for SHARP FEM(new)
-		DHD_ERROR(("%s: CIS reading success, err=%d\n",
+		DHD_ERROR(("%s: CIS reading success, ret=%d\n",
 			__FUNCTION__, ret));
 #ifdef DUMP_CIS
 		dump_cis(cis_buf, 48);

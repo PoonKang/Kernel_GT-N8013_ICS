@@ -1137,8 +1137,7 @@ wl_cfgp2p_has_ie(u8 *ie, u8 **tlvs, u32 *tlvs_len, const u8 *oui, u32 oui_len, u
 
 	/* If the contents match the SAMSUNG OUI */
 	if (ie[TLV_LEN_OFF] >= oui_len + 1 &&
-	        !bcmp(&ie[TLV_BODY_OFF], oui, oui_len) &&
-	        !bcmp(oui, SAMSUNG_OUI, SAMSUNG_OUI_LEN)) {
+		!bcmp(&ie[TLV_BODY_OFF], oui, oui_len)) { 
 		return TRUE;
 	}
 
@@ -1732,7 +1731,7 @@ wl_cfgp2p_supported(struct wl_priv *wl, struct net_device *ndev)
 	ret = wldev_iovar_getint(ndev, "p2p",
 	               &p2p_supported);
 	if (ret < 0) {
-		CFGP2P_ERR(("wl p2p error %d\n", ret));
+		CFGP2P_ERR(("wl p2p supported IOVAR = %d\n", ret));
 		return 0;
 	}
 	if (p2p_supported == 1) {

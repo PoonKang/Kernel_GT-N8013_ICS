@@ -179,6 +179,8 @@ char fw_down_path[MOD_PARAM_PATHLEN];
 #define	MIN_RSRC_SR			0x3
 #define	CORE_CAPEXT_ADDR		(SI_ENUM_BASE + 0x64c)
 #define	CORE_CAPEXT_SR_SUPPORTED_MASK	(1 << 1)
+#define RCTL_MACPHY_DISABLE_MASK        (1 << 26)
+#define RCTL_LOGIC_DISABLE_MASK         (1 << 27)
 
 #define	OOB_WAKEUP_ENAB(bus)		((bus)->_oobwakeup)
 #define	GPIO_DEV_SRSTATE		16	/* Host gpio17 mapped to device gpio0 SR state */
@@ -609,22 +611,21 @@ static bool
 dhdsdio_sr_cap(dhd_bus_t *bus)
 {
 	bool cap = FALSE;
-	uint32 min = 0, core_capext;
+	uint32 min = 0, core_capext, data;
 
 	core_capext = bcmsdh_reg_read(bus->sdh, CORE_CAPEXT_ADDR, 4);
 	if (!(core_capext & CORE_CAPEXT_SR_SUPPORTED_MASK))
 		return FALSE;
 
+	if (bus->sih->chip == BCM4324_CHIP_ID) {
 	min = bcmsdh_reg_read(bus->sdh, MIN_RSRC_ADDR, 4);
-	if (min == MIN_RSRC_SR) {
+		if (min == MIN_RSRC_SR)
 		cap = TRUE;
-
-		if ((bus->sih->chip == BCM4334_CHIP_ID) && (bus->sih->chiprev < 3)) {
-			cap = FALSE;
-
-			DHD_ERROR(("Only 4334 >= B2 supports SR: curr rev %d\n",
-				bus->sih->chiprev));
-		}
+	} else {
+		data = bcmsdh_reg_read(bus->sdh,
+			SI_ENUM_BASE + OFFSETOF(chipcregs_t, retention_ctl), 4);
+		if ((data & (RCTL_MACPHY_DISABLE_MASK | RCTL_LOGIC_DISABLE_MASK)) == 0)
+			cap = TRUE;
 	}
 
 	return cap;
@@ -3942,7 +3943,10 @@ dhdsdio_rxglom(dhd_bus_t *bus, uint8 rxseq)
 	uint8 *dptr, num = 0;
 
 	uint16 sublen, check;
-	void *pfirst, *plast, *pnext, *save_pfirst;
+	void *pfirst, *plast, *pnext;
+	void * list_tail[DHD_MAX_IFS] = { NULL };
+	void * list_head[DHD_MAX_IFS] = { NULL };
+	uint8 idx;
 	osl_t *osh = bus->dhd->osh;
 
 	int errcode;
@@ -4231,7 +4235,6 @@ dhdsdio_rxglom(dhd_bus_t *bus, uint8 rxseq)
 		}
 
 		/* Basic SD framing looks ok - process each packet (header) */
-		save_pfirst = pfirst;
 		bus->glom = NULL;
 		plast = NULL;
 
@@ -4274,9 +4277,6 @@ dhdsdio_rxglom(dhd_bus_t *bus, uint8 rxseq)
 				PKTFREE(bus->dhd->osh, pfirst, FALSE);
 				if (plast) {
 					PKTSETNEXT(osh, plast, pnext);
-				} else {
-					ASSERT(save_pfirst == pfirst);
-					save_pfirst = pnext;
 				}
 				continue;
 			} else if (dhd_prot_hdrpull(bus->dhd, &ifidx, pfirst, reorder_info_buf,
@@ -4286,9 +4286,6 @@ dhdsdio_rxglom(dhd_bus_t *bus, uint8 rxseq)
 				PKTFREE(osh, pfirst, FALSE);
 				if (plast) {
 					PKTSETNEXT(osh, plast, pnext);
-				} else {
-					ASSERT(save_pfirst == pfirst);
-					save_pfirst = pnext;
 				}
 				continue;
 			}
@@ -4304,9 +4301,6 @@ dhdsdio_rxglom(dhd_bus_t *bus, uint8 rxseq)
 				if (free_buf_count == 0) {
 					if (plast) {
 						PKTSETNEXT(osh, plast, pnext);
-					} else {
-						ASSERT(save_pfirst == pfirst);
-						save_pfirst = pnext;
 					}
 					continue;
 				}
@@ -4319,15 +4313,14 @@ dhdsdio_rxglom(dhd_bus_t *bus, uint8 rxseq)
 						temp = PKTNEXT(osh, temp);
 					}
 					pfirst = temp;
-					if (plast) {
-						PKTSETNEXT(osh, plast, ppfirst);
+					if (list_tail[ifidx] == NULL) {
+						list_head[ifidx] = ppfirst;
+						list_tail[ifidx] = pfirst;
 					}
 					else {
-						/* first one in the chain */
-						save_pfirst = ppfirst;
+						PKTSETNEXT(osh, list_tail[ifidx], ppfirst);
+						list_tail[ifidx] = pfirst;
 					}
-
-					PKTSETNEXT(osh, pfirst, pnext);
 					plast = pfirst;
 				}
 
@@ -4335,8 +4328,14 @@ dhdsdio_rxglom(dhd_bus_t *bus, uint8 rxseq)
 			}
 			else {
 				/* this packet will go up, link back into chain and count it */
-				PKTSETNEXT(osh, pfirst, pnext);
 				plast = pfirst;
+				if (list_tail[ifidx] == NULL) {
+					list_head[ifidx] = list_tail[ifidx] = pfirst;
+				}
+				else {
+					PKTSETNEXT(osh, list_tail[ifidx], pfirst);
+					list_tail[ifidx] = pfirst;
+				}
 				num++;
 			}
 #ifdef DHD_DEBUG
@@ -4351,12 +4350,22 @@ dhdsdio_rxglom(dhd_bus_t *bus, uint8 rxseq)
 #endif /* DHD_DEBUG */
 		}
 		dhd_os_sdunlock_rxq(bus->dhd);
-		if (num) {
-			dhd_os_sdunlock(bus->dhd);
-			dhd_rx_frame(bus->dhd, ifidx, save_pfirst, num, 0);
-			dhd_os_sdlock(bus->dhd);
+		for (idx = 0; idx < DHD_MAX_IFS; idx++) {
+			if (list_head[idx]) {
+				void *temp;
+				uint8 cnt = 0;
+				temp = list_head[idx];
+				do {
+					temp = PKTNEXT(osh, temp);
+					cnt++;
+				} while (temp);
+				if (cnt) {
+					dhd_os_sdunlock(bus->dhd);
+					dhd_rx_frame(bus->dhd, idx, list_head[idx], cnt, 0);
+					dhd_os_sdlock(bus->dhd);
+				}
+			}
 		}
-
 		bus->rxglomframes++;
 		bus->rxglompkts += num;
 	}
@@ -6130,7 +6139,7 @@ dhdsdio_probe(uint16 venid, uint16 devid, uint16 bus_no, uint16 slot,
 #ifdef BCMHOST_XTAL_PU_TIME_MOD
 #ifdef BCM4334_CHIP
 	bcmsdh_reg_write(bus->sdh, 0x18000620, 2, 11);
-	bcmsdh_reg_write(bus->sdh, 0x18000628, 4, 0x00A60001);
+	bcmsdh_reg_write(bus->sdh, 0x18000628, 4, 0x00F80001);
 #endif
 #endif
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 25))
