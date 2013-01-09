@@ -553,6 +553,78 @@ static ssize_t show_scaling_setspeed(struct cpufreq_policy *policy, char *buf)
 	return policy->governor->show_setspeed(policy, buf);
 }
 
+extern ssize_t acpuclk_get_vdd_levels_str(char *buf);
+static ssize_t show_vdd_levels(struct cpufreq_policy *policy, char *buf)
+{
+return acpuclk_get_vdd_levels_str(buf);
+}
+
+extern void acpuclk_set_vdd(unsigned acpu_khz, int vdd);
+static ssize_t store_vdd_levels(struct cpufreq_policy *policy, const char *buf, size_t count)
+{
+int i = 0, j;
+int pair[2] = { 0, 0 };
+int sign = 0;
+
+if (count < 1)
+return 0;
+
+if (buf[0] == '-')
+{
+sign = -1;
+i++;
+}
+else if (buf[0] == '+')
+{
+sign = 1;
+i++;
+}
+
+for (j = 0; i < count; i++)
+{
+char c = buf[i];
+if ((c >= '0') && (c <= '9'))
+{
+pair[j] *= 10;
+pair[j] += (c - '0');
+}
+else if ((c == ' ') || (c == '\t'))
+{
+if (pair[j] != 0)
+{
+j++;
+if ((sign != 0) || (j > 1))
+break;
+}
+}
+else
+break;
+}
+
+if (sign != 0)
+{
+if (pair[0] > 0)
+acpuclk_set_vdd(0, sign * pair[0]);
+}
+else
+{
+if ((pair[0] > 0) && (pair[1] > 0))
+acpuclk_set_vdd((unsigned)pair[0], pair[1]);
+else
+return -EINVAL;
+}
+
+return count;
+}
+
+/* sysfs interface for UV control */
+extern ssize_t show_UV_mV_table(struct cpufreq_policy *policy, char *buf);
+extern ssize_t store_UV_mV_table(struct cpufreq_policy *policy,
+                                      const char *buf, size_t count);
+extern ssize_t show_UV_uV_table(struct cpufreq_policy *policy, char *buf);
+extern ssize_t store_UV_uV_table(struct cpufreq_policy *policy,
+				 const char *buf, size_t count);
+
 /**
  * show_scaling_driver - show the current cpufreq HW/BIOS limitation
  */
@@ -582,6 +654,9 @@ cpufreq_freq_attr_rw(scaling_min_freq);
 cpufreq_freq_attr_rw(scaling_max_freq);
 cpufreq_freq_attr_rw(scaling_governor);
 cpufreq_freq_attr_rw(scaling_setspeed);
+cpufreq_freq_attr_rw(vdd_levels);
+cpufreq_freq_attr_rw(UV_mV_table);
+cpufreq_freq_attr_rw(UV_uV_table);
 
 static struct attribute *default_attrs[] = {
 	&cpuinfo_min_freq.attr,
@@ -595,6 +670,9 @@ static struct attribute *default_attrs[] = {
 	&scaling_driver.attr,
 	&scaling_available_governors.attr,
 	&scaling_setspeed.attr,
+	&vdd_levels.attr,
+	&UV_mV_table.attr,
+	&UV_uV_table.attr,
 	NULL
 };
 
