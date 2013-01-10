@@ -238,7 +238,7 @@ static int set_ext_micbias(struct snd_soc_dapm_widget *w,
 	switch (event) {
 	case SND_SOC_DAPM_PRE_PMU:
 		gpio_set_value(GPIO_MIC_BIAS_EN, 1);
-		msleep(150);
+		msleep(100);
 		break;
 	case SND_SOC_DAPM_POST_PMD:
 		gpio_set_value(GPIO_MIC_BIAS_EN, 0);
@@ -259,7 +259,7 @@ static int set_ext_submicbias(struct snd_soc_dapm_widget *w,
 	switch (event) {
 	case SND_SOC_DAPM_PRE_PMU:
 		gpio_set_value(GPIO_SUB_MIC_BIAS_EN, 1);
-		msleep(150);
+		msleep(100);
 		break;
 	case SND_SOC_DAPM_POST_PMD:
 		gpio_set_value(GPIO_SUB_MIC_BIAS_EN, 0);
@@ -1074,6 +1074,12 @@ static int m3_card_suspend_post(struct snd_soc_card *card)
 		if (ret < 0)
 			dev_err(codec->dev, "Unable to stop FLL1\n");
 
+		ret = snd_soc_dai_set_fmt(aif1_dai, SND_SOC_DAIFMT_I2S
+						| SND_SOC_DAIFMT_NB_NF
+						| SND_SOC_DAIFMT_CBS_CFS);
+		if (ret < 0)
+			dev_err(codec->dev, "Unable to set I2S SLAVE MODE\n");
+
 		midas_snd_set_mclk(false, true);
 	}
 
@@ -1111,6 +1117,12 @@ static int m3_card_resume_pre(struct snd_soc_card *card)
 
 	if (ret < 0)
 		dev_err(aif1_dai->dev, "Unable to switch to FLL1: %d\n", ret);
+
+	ret = snd_soc_dai_set_fmt(aif1_dai, SND_SOC_DAIFMT_I2S
+						| SND_SOC_DAIFMT_NB_NF
+						| SND_SOC_DAIFMT_CBM_CFM);
+	if (ret < 0)
+		dev_err(codec->dev, "Unable to set I2S MASTER MODE\n");
 
 	return 0;
 }
