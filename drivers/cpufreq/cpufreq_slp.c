@@ -36,9 +36,16 @@
 #endif
 #define EARLYSUSPEND_HOTPLUGLOCK 1
 
+
+#if defined(CONFIG_SLP_CHECK_CPU_LOAD)
+#define CONFIG_SLP_ADAPTIVE_HOTPLUG 1
+#endif
+
 /*
  * runqueue average
  */
+
+#define CPU_NUM	NR_CPUS
 
 #define RQ_AVG_TIMER_RATE	10
 
@@ -217,10 +224,18 @@ struct cpu_dbs_info_s {
 	cputime64_t prev_cpu_iowait;
 	cputime64_t prev_cpu_wall;
 	cputime64_t prev_cpu_nice;
+
+	unsigned int cpufreq_old;
+	unsigned int cpufreq_new;
+
 	struct cpufreq_policy *cur_policy;
 	struct delayed_work work;
+#ifdef CONFIG_SLP_GOV_DYNAMIC_PARAMS
+	struct delayed_work params_work;
+#endif /* CONFIG_SLP_GOV_DYNAMIC_PARAMS */
 	struct work_struct up_work;
 	struct work_struct down_work;
+	struct work_struct mfl_hotplug_work;
 	struct cpufreq_frequency_table *freq_table;
 	unsigned int rate_mult;
 	int cpu;
@@ -230,12 +245,39 @@ struct cpu_dbs_info_s {
 	 * when user is changing the governor or limits.
 	 */
 	struct mutex timer_mutex;
+#ifdef CONFIG_SLP_GOV_DYNAMIC_PARAMS
+	struct mutex params_mutex;
+#endif /* CONFIG_SLP_GOV_DYNAMIC_PARAMS */
 };
 static DEFINE_PER_CPU(struct cpu_dbs_info_s, od_cpu_dbs_info);
 
 static struct workqueue_struct *dvfs_workqueue;
 
 static unsigned int dbs_enable;	/* number of CPUs using this policy */
+
+#ifdef CONFIG_SLP_GOV_DYNAMIC_PARAMS
+/* SLP Gov. dynamic Params is new feature which provides better performance
+   and more efficient power consumption at application launching time.
+   There are three param to support this feature.
+ */
+#define DYNAMIC_PARAMS_MAX				 3
+
+#define DYNAMIC_PARAMS_MIN_INTERVAL		 200000
+#define DYNAMIC_PARAMS_MIN_FREQ			 200000
+#ifdef CONFIG_EXYNOS4X12_1400MHZ_SUPPORT
+#define DYNAMIC_PARAMS_MAX_FREQ			 1400000
+#else
+#error    SLP Governor only supports EXYNOS4412 now
+#endif
+#define DYNAMIC_PARAMS_MIN_CPU			 1
+#ifdef CONFIG_CPU_EXYNOS4412
+#define DYNAMIC_PARAMS_MAX_CPU			 4
+#else
+#error    SLP Governor only supports EXYNOS4412 now
+#endif
+
+static struct workqueue_struct *dynamic_params_workqueue;
+#endif /* CONFIG_SLP_GOV_DYNAMIC_PARAMS */
 
 /*
  * dbs_mutex protects dbs_enable in governor start/stop.
@@ -265,6 +307,16 @@ static struct dbs_tuners {
 #ifdef CONFIG_HAS_EARLYSUSPEND
 	int early_suspend;
 #endif
+#ifdef CONFIG_SLP_GOV_DYNAMIC_PARAMS
+	unsigned int dynamic_params;
+
+	unsigned int params_min_interval;
+	unsigned int params_min_freq;
+	unsigned int params_min_cpu;
+
+	unsigned int params_stat_min_freq;
+	unsigned int params_stat_min_cpu;
+#endif /* CONFIG_SLP_GOV_DYNAMIC_PARAMS */
 } dbs_tuners_ins = {
 	.up_threshold = DEF_FREQUENCY_UP_THRESHOLD,
 	.sampling_down_factor = DEF_SAMPLING_DOWN_FACTOR,
@@ -283,6 +335,16 @@ static struct dbs_tuners {
 #ifdef CONFIG_HAS_EARLYSUSPEND
 	.early_suspend = -1,
 #endif
+#ifdef CONFIG_SLP_GOV_DYNAMIC_PARAMS
+	.dynamic_params = 0,
+
+	.params_min_interval = 0,
+	.params_min_freq = 0,
+	.params_min_cpu = 0,
+
+	.params_stat_min_freq = 0,
+	.params_stat_min_cpu = 0,
+#endif /* CONFIG_SLP_GOV_DYNAMIC_PARAMS */
 };
 
 
@@ -359,7 +421,7 @@ static int cpufreq_pegasusq_cpu_unlock(int num_core)
  */
 struct cpu_usage {
 	unsigned int freq;
-	unsigned int load[NR_CPUS];
+	unsigned int load[CPU_NUM];
 	unsigned int rq_avg;
 };
 
@@ -764,23 +826,353 @@ static ssize_t store_dvfs_debug(struct kobject *a, struct attribute *b,
 
 /******************************************************************************/
 
+static int get_index(int cnt, int ring_size, int diff)
+{
+	int ret = 0, modified_diff;
+
+	if ((diff > ring_size) || (diff * (-1) > ring_size))
+		modified_diff = diff % ring_size;
+	else
+		modified_diff = diff;
+
+	ret = (ring_size + cnt + modified_diff) % ring_size;
+
+	return ret;
+}
+
+
 #ifdef CONFIG_SLP_CHECK_CPU_LOAD
-#define CPU_LOAD_HISTORY_NUM 1024
+
+#define CPU_TASK_HISTORY_NUM 30000
+struct cpu_task_history_tag {
+	unsigned long long time;
+	struct task_struct *task;
+	unsigned int pid;
+};
+static struct cpu_task_history_tag
+	cpu_task_history[CPU_NUM][CPU_TASK_HISTORY_NUM];
+static struct cpu_task_history_tag
+	cpu_task_history_view[CPU_NUM][CPU_TASK_HISTORY_NUM];
+
+struct list_head process_headlist;
+
+static unsigned int  cpu_task_history_cnt[CPU_NUM];
+static unsigned int  cpu_task_history_show_start_cnt;
+static unsigned int  cpu_task_history_show_end_cnt;
+static  int  cpu_task_history_show_select_cpu;
+
+static unsigned long long  total_time, section_start_time, section_end_time;
+
+void __slp_store_task_history(unsigned int cpu, struct task_struct *task)
+{
+	unsigned int cnt;
+
+	if (++cpu_task_history_cnt[cpu] >= CPU_TASK_HISTORY_NUM)
+		cpu_task_history_cnt[cpu] = 0;
+	cnt = cpu_task_history_cnt[cpu];
+
+	cpu_task_history[cpu][cnt].time = cpu_clock(UINT_MAX);
+	cpu_task_history[cpu][cnt].task = task;
+	cpu_task_history[cpu][cnt].pid = task->pid;
+}
+
+struct cpu_process_runtime_tag {
+	struct list_head list;
+	unsigned long long runtime;
+	struct task_struct *task;
+	unsigned int pid;
+	unsigned int cnt;
+	unsigned int usage;
+};
+
+static unsigned long long calc_delta_time(unsigned int cpu, unsigned int index)
+{
+	unsigned long long run_start_time, run_end_time;
+
+	if (index == 0) {
+		run_start_time
+		    = cpu_task_history_view[cpu][CPU_TASK_HISTORY_NUM-1].time;
+	} else
+		run_start_time = cpu_task_history_view[cpu][index-1].time;
+
+	if (run_start_time < section_start_time)
+		run_start_time = section_start_time;
+
+	run_end_time = cpu_task_history_view[cpu][index].time;
+
+	if (run_end_time < section_start_time)
+		return 0;
+
+	if (run_end_time > section_end_time)
+		run_end_time = section_end_time;
+
+	return  run_end_time - run_start_time;
+}
+
+
+static void add_process_to_list(unsigned int cpu, unsigned int index)
+{
+	struct cpu_process_runtime_tag *new_process;
+
+	new_process
+		= kmalloc(sizeof(struct cpu_process_runtime_tag), GFP_KERNEL);
+	new_process->runtime = calc_delta_time(cpu, index);
+	new_process->cnt = 1;
+	new_process->task = cpu_task_history_view[cpu][index].task;
+	new_process->pid = cpu_task_history_view[cpu][index].pid;
+
+	if (new_process->runtime != 0) {
+		INIT_LIST_HEAD(&new_process->list);
+		list_add_tail(&new_process->list, &process_headlist);
+	} else
+		kfree(new_process);
+
+	return;
+}
+
+static void del_process_list(void)
+{
+	struct cpu_process_runtime_tag *curr;
+	struct list_head *p;
+
+	list_for_each_prev(p, &process_headlist) {
+		curr = list_entry(p, struct cpu_process_runtime_tag, list);
+		kfree(curr);
+	}
+	process_headlist.prev = NULL;
+	process_headlist.next = NULL;
+
+}
+
+
+#define CPU_LOAD_HISTORY_NUM 1000
 
 struct cpu_load_freq_history_tag {
 	char time[16];
+	unsigned long long time_stamp;
 	unsigned int cpufreq;
-	unsigned int cpu_load[NR_CPUS];
+	unsigned int cpu_load[CPU_NUM];
 	unsigned int touch_event;
 	unsigned int nr_onlinecpu;
+	unsigned int nr_run_avg;
+	unsigned int task_history_cnt[CPU_NUM];
 };
 static struct cpu_load_freq_history_tag
 	cpu_load_freq_history[CPU_LOAD_HISTORY_NUM];
 static struct cpu_load_freq_history_tag
 	cpu_load_freq_history_view[CPU_LOAD_HISTORY_NUM];
 static unsigned int  cpu_load_freq_history_cnt;
+static unsigned int  cpu_load_freq_history_view_cnt;
 
-static  int  cpu_load_freq_history_show_cnt = 100;
+static  int  cpu_load_freq_history_show_cnt = 85;
+
+struct cpu_process_runtime_tag temp_process_runtime;
+
+static int comp_list_runtime(struct list_head *list1, struct list_head *list2)
+{
+	struct cpu_process_runtime_tag *list1_struct, *list2_struct;
+
+	int ret = 0;
+	 list1_struct = list_entry(list1, struct cpu_process_runtime_tag, list);
+	 list2_struct = list_entry(list2, struct cpu_process_runtime_tag, list);
+
+	if (list1_struct->runtime > list2_struct->runtime)
+		ret = 1;
+	else if (list1_struct->runtime < list2_struct->runtime)
+		ret = -1;
+	else
+		ret  = 0;
+
+	return ret;
+}
+
+static void swap_process_list(struct list_head *list1, struct list_head *list2)
+{
+	struct list_head *list1_prev, *list1_next , *list2_prev, *list2_next;
+
+	list1_prev = list1->prev;
+	list1_next = list1->next;
+
+	list2_prev = list2->prev;
+	list2_next = list2->next;
+
+	list1->prev = list2;
+	list1->next = list2_next;
+
+	list2->prev = list1_prev;
+	list2->next = list1;
+
+	list1_prev->next = list2;
+	list2_next->prev = list1;
+
+}
+
+static unsigned int view_list(char *buf, unsigned int ret)
+{
+	struct list_head *p;
+	struct cpu_process_runtime_tag *curr;
+	char task_name[80] = {0,};
+	char *p_name = NULL;
+
+	unsigned int cnt = 0, list_num = 0;
+	unsigned long long  t, total_time_for_clc;
+
+	list_for_each(p, &process_headlist) {
+		curr = list_entry(p, struct cpu_process_runtime_tag, list);
+		list_num++;
+	}
+
+	for (cnt = 0; cnt < list_num; cnt++) {
+		list_for_each(p, &process_headlist) {
+		curr = list_entry(p, struct cpu_process_runtime_tag, list);
+			if (p->next != &process_headlist) {
+				if (comp_list_runtime(p, p->next) == -1)
+					swap_process_list(p, p->next);
+			}
+		}
+	}
+
+	total_time_for_clc = total_time;
+	do_div(total_time_for_clc, 100);
+
+	cnt = 1;
+	list_for_each(p, &process_headlist) {
+		curr = list_entry(p, struct cpu_process_runtime_tag, list);
+		t = curr->runtime * 100 + 5;
+		do_div(t, total_time_for_clc);
+		curr->usage = t;
+
+		if ((curr != NULL) && (curr->task != NULL)
+			&& (curr->task->pid == curr->pid)) {
+			p_name = curr->task->comm;
+
+		} else {
+			snprintf(task_name, sizeof(task_name)
+						, "NOT found task");
+			p_name = task_name;
+		}
+
+		if (ret < PAGE_SIZE - 1) {
+			ret +=  snprintf(buf + ret, PAGE_SIZE - ret,
+				"[%2d] %16s(%4d) %4d[sched] %11lld[ns]"\
+				" %3d.%02d[%%]\n"
+				, cnt++, p_name, curr->pid
+				, curr->cnt, curr->runtime
+				, curr->usage/100, curr->usage%100);
+		} else
+			break;
+	}
+
+	return ret;
+}
+
+
+static struct cpu_process_runtime_tag *search_exist_pid(unsigned int pid)
+{
+	struct list_head *p;
+	struct cpu_process_runtime_tag *curr;
+
+	list_for_each(p, &process_headlist) {
+		curr = list_entry(p, struct cpu_process_runtime_tag, list);
+		if (curr->pid == pid)
+			return curr;
+	}
+	return NULL;
+}
+
+static void clc_process_run_time(unsigned int cpu
+			, unsigned int start_cnt, unsigned int end_cnt)
+{
+	unsigned  int cnt = 0,  start_array_num;
+	unsigned int end_array_num, end_array_num_plus1;
+	unsigned int i, loop_cnt;
+	struct cpu_process_runtime_tag *process_runtime_data;
+	unsigned long long t1, t2;
+
+	start_array_num
+	    = (cpu_load_freq_history_view[start_cnt].task_history_cnt[cpu] + 1)
+		% CPU_TASK_HISTORY_NUM;
+
+	section_start_time
+		= cpu_load_freq_history_view[start_cnt].time_stamp;
+	section_end_time
+		= cpu_load_freq_history_view[end_cnt].time_stamp;
+
+	end_array_num
+	= cpu_load_freq_history_view[end_cnt].task_history_cnt[cpu];
+	end_array_num_plus1
+	= (cpu_load_freq_history_view[end_cnt].task_history_cnt[cpu] + 1)
+			% CPU_TASK_HISTORY_NUM;
+
+
+	t1 = cpu_task_history_view[cpu][end_array_num].time;
+	t2 = cpu_task_history_view[cpu][end_array_num_plus1].time;
+
+	if (t2 < t1)
+		end_array_num_plus1 = end_array_num;
+
+	total_time = section_end_time - section_start_time;
+
+	if (process_headlist.next != NULL)
+		del_process_list();
+
+	INIT_LIST_HEAD(&process_headlist);
+
+	if (end_array_num_plus1 >= start_array_num)
+		loop_cnt = end_array_num_plus1-start_array_num + 1;
+	else
+		loop_cnt = end_array_num_plus1
+				+ CPU_TASK_HISTORY_NUM - start_array_num + 1;
+
+	for (i = start_array_num, cnt = 0; cnt < loop_cnt; cnt++, i++) {
+		if (i >= CPU_TASK_HISTORY_NUM)
+			i = 0;
+		process_runtime_data
+			= search_exist_pid(cpu_task_history_view[cpu][i].pid);
+		if (process_runtime_data == NULL)
+			add_process_to_list(cpu, i);
+		else {
+			process_runtime_data->runtime
+				+= calc_delta_time(cpu, i);
+			process_runtime_data->cnt++;
+		}
+	}
+
+}
+
+static void process_sched_time_view(unsigned int cpu,
+			unsigned int start_cnt, unsigned int end_cnt)
+{
+	unsigned  int i = 0, start_array_num;
+	unsigned int end_array_num, start_array_num_for_time;
+
+	start_array_num_for_time
+	= cpu_load_freq_history_view[start_cnt].task_history_cnt[cpu];
+	start_array_num
+	= (cpu_load_freq_history_view[start_cnt].task_history_cnt[cpu]+1)
+			% CPU_TASK_HISTORY_NUM;
+	end_array_num
+		= cpu_load_freq_history_view[end_cnt].task_history_cnt[cpu];
+
+	total_time = section_end_time - section_start_time;
+
+	if (end_cnt == start_cnt+1) {
+		pr_emerg("[%d] TOTAL SECTION TIME = %lld[ns]\n\n"
+			, end_cnt, total_time);
+	} else {
+		pr_emerg("[%d~%d] TOTAL SECTION TIME = %lld[ns]\n\n"
+					, start_cnt+1, end_cnt, total_time);
+	}
+
+	for (i = start_array_num_for_time; i <= end_array_num+2; i++) {
+		pr_emerg("[%d] %lld %16s %4d\n", i
+			, cpu_task_history_view[cpu][i].time
+			, cpu_task_history_view[cpu][i].task->comm
+			, cpu_task_history_view[cpu][i].pid);
+	}
+
+}
+
 
 void cpu_load_touch_event(unsigned int event)
 {
@@ -794,7 +1186,8 @@ void cpu_load_touch_event(unsigned int event)
 
 }
 
-static void store_cpu_load(unsigned int cpufreq, unsigned int cpu_load[])
+static void store_cpu_load(unsigned int cpufreq, unsigned int cpu_load[]
+						, unsigned int nr_run_avg)
 {
 	unsigned int j = 0, cnt = 0;
 	unsigned long long t;
@@ -807,15 +1200,23 @@ static void store_cpu_load(unsigned int cpufreq, unsigned int cpu_load[])
 	cpu_load_freq_history[cnt].cpufreq = cpufreq;
 
 	t = cpu_clock(UINT_MAX);
+	cpu_load_freq_history[cnt].time_stamp = t;
 	nanosec_rem = do_div(t, 1000000000);
 	sprintf(cpu_load_freq_history[cnt].time, "%2lu.%02lu"
 				, (unsigned long) t, nanosec_rem / 10000000);
 
-	for (j = 0; j < NR_CPUS; j++)
+	for (j = 0; j < CPU_NUM; j++)
 		cpu_load_freq_history[cnt].cpu_load[j] = cpu_load[j];
 
 	cpu_load_freq_history[cnt].touch_event = 0;
 	cpu_load_freq_history[cnt].nr_onlinecpu = num_online_cpus();
+	cpu_load_freq_history[cnt].nr_run_avg = nr_run_avg;
+
+	for (j = 0; j < CPU_NUM; j++) {
+		cpu_load_freq_history[cnt].task_history_cnt[j]
+			= cpu_task_history_cnt[j];
+	}
+
 }
 
 
@@ -843,21 +1244,16 @@ static ssize_t store_cpu_load_freq(struct kobject *a, struct attribute *b,
 	return count;
 }
 
-static ssize_t show_cpu_load_freq(struct kobject *kobj,
-					struct attribute *attr, char *buf)
+
+unsigned int show_cpu_load_freq_sub(int cnt, int show_cnt, char *buf, int ret)
 {
-	int ret = 0;
-	 int j = 0, cnt = 0, delta = 0;
-	cnt = cpu_load_freq_history_cnt;
+	int j, delta = 0;
 
-	memcpy(cpu_load_freq_history_view, cpu_load_freq_history
-					, sizeof(cpu_load_freq_history_view));
-
-	if ((cnt - cpu_load_freq_history_show_cnt) < 0) {
-		delta = cnt - cpu_load_freq_history_show_cnt;
+	if ((cnt - show_cnt) < 0) {
+		delta = cnt - show_cnt;
 		cnt = CPU_LOAD_HISTORY_NUM + delta;
 	} else
-		cnt -= cpu_load_freq_history_show_cnt;
+		cnt -= show_cnt;
 
 	if ((cnt+1 >= CPU_LOAD_HISTORY_NUM)
 			|| (cpu_load_freq_history_view[cnt+1].time == 0))
@@ -865,30 +1261,427 @@ static ssize_t show_cpu_load_freq(struct kobject *kobj,
 	else
 		cnt++;
 
-	for (j = 0; j < cpu_load_freq_history_show_cnt; j++) {
+	ret +=  snprintf(buf + ret, PAGE_SIZE - ret
+		, "======================================="
+		"========================================\n");
+	ret +=  snprintf(buf + ret, PAGE_SIZE - ret
+		, "    TIME    CPU_FREQ   [INDEX]\tCPU0 \tCPU1" \
+			  " \tCPU2\tCPU3\tONLINE\tNR_RUN\n");\
+
+	for (j = 0; j < show_cnt; j++) {
 
 		if (cnt > CPU_LOAD_HISTORY_NUM-1)
 			cnt = 0;
 
-		 pr_emerg("[%4d] \t%s \t%7d \t%3d \t%3d \t%3d \t%3d \t%3d\n"
-				, cnt
-				, cpu_load_freq_history_view[cnt].time
-				, cpu_load_freq_history_view[cnt].cpufreq
-				, cpu_load_freq_history_view[cnt].cpu_load[0]
-				, cpu_load_freq_history_view[cnt].cpu_load[1]
-				, cpu_load_freq_history_view[cnt].cpu_load[2]
-				, cpu_load_freq_history_view[cnt].cpu_load[3]
-				, cpu_load_freq_history[cnt].nr_onlinecpu);
-
+		if (ret < PAGE_SIZE - 1) {
+			ret +=  snprintf(buf + ret, PAGE_SIZE - ret
+			, "%8s\t%d.%d\t[%3d]\t%3d\t%3d\t%3d\t%3d\t%3d "
+				"\t%2d.%02d\n"
+			, cpu_load_freq_history_view[cnt].time
+			, cpu_load_freq_history_view[cnt].cpufreq/1000000
+			, (cpu_load_freq_history_view[cnt].cpufreq/100000) % 10
+			, cnt
+			, cpu_load_freq_history_view[cnt].cpu_load[0]
+			, cpu_load_freq_history_view[cnt].cpu_load[1]
+			, cpu_load_freq_history_view[cnt].cpu_load[2]
+			, cpu_load_freq_history_view[cnt].cpu_load[3]
+			, cpu_load_freq_history_view[cnt].nr_onlinecpu
+			, cpu_load_freq_history_view[cnt].nr_run_avg/100
+			, cpu_load_freq_history_view[cnt].nr_run_avg%100);
+		} else
+			break;
 		++cnt;
 	}
-
 	return ret;
+
+}
+
+static ssize_t show_cpu_load_freq(struct kobject *kobj,
+					struct attribute *attr, char *buf)
+{
+	int ret = 0;
+	int cnt = 0, show_cnt;
+	int buffer_size = 0;
+
+	cpu_load_freq_history_view_cnt = cpu_load_freq_history_cnt;
+	cnt = cpu_load_freq_history_view_cnt - 1;
+	memcpy(cpu_load_freq_history_view, cpu_load_freq_history
+					, sizeof(cpu_load_freq_history_view));
+
+	memcpy(cpu_task_history_view, cpu_task_history
+					, sizeof(cpu_task_history_view));
+
+	show_cnt = cpu_load_freq_history_show_cnt;
+
+	ret = show_cpu_load_freq_sub(cnt, show_cnt, buf,  ret);
+
+	buffer_size = strlen(buf);
+
+	return buffer_size;
+}
+
+
+static void set_cpu_load_freq_history_array_range(const char *buf)
+{
+	int show_array_num = 0, select_cpu;
+	char cpy_buf[80] = {0,};
+	char *p1, *p2;
+
+	p1 = strstr(buf, "-");
+	p2 = strstr(buf, "c");
+	if (p2 == NULL)
+		p2 = strstr(buf, "C");
+
+	if (p2 != NULL) {
+		select_cpu = atoi(p2+1);
+		if (select_cpu >= 0 && select_cpu < 4)
+			cpu_task_history_show_select_cpu = select_cpu;
+		else
+			cpu_task_history_show_select_cpu = 0;
+	} else
+		cpu_task_history_show_select_cpu = 0;
+
+	if (p1 != NULL) {
+		strncpy(cpy_buf, buf, sizeof(cpy_buf) - 1);
+		*p1 = '\0';
+		cpu_task_history_show_start_cnt = atoi(cpy_buf) - 1;
+		cpu_task_history_show_end_cnt = atoi(p1+1);
+
+	} else {
+		show_array_num = atoi(buf);
+		cpu_task_history_show_start_cnt = show_array_num - 1;
+		cpu_task_history_show_end_cnt = show_array_num;
+	}
+
+}
+
+
+static ssize_t store_check_running(struct kobject *a, struct attribute *b,
+				  const char *buf, size_t count)
+{
+
+	set_cpu_load_freq_history_array_range(buf);
+
+	return count;
+}
+
+static ssize_t show_check_running(struct kobject *kobj,
+				struct attribute *attr, char *buf)
+{
+	unsigned int i, ret = 0;
+	int buf_size = 0;
+
+	unsigned int start_cnt = cpu_task_history_show_start_cnt;
+	unsigned int end_cnt = cpu_task_history_show_end_cnt;
+	unsigned long  msec_rem;
+	unsigned long long t;
+
+	for (i = 0; i < CPU_NUM ; i++) {
+		if (cpu_task_history_show_select_cpu != -1)
+			if (i != cpu_task_history_show_select_cpu)
+				continue;
+		clc_process_run_time(i, start_cnt, end_cnt);
+
+		t = total_time;
+		msec_rem = do_div(t, 1000000);
+
+		if (end_cnt == start_cnt+1) {
+			ret +=  snprintf(buf + ret, PAGE_SIZE - ret,
+				"[%d] TOTAL SECTION TIME = %ld.%ld[ms]\n\n"
+				, end_cnt	, (unsigned long)t, msec_rem);
+		} else {
+			ret +=  snprintf(buf + ret, PAGE_SIZE - ret,
+				"[%d~%d] TOTAL SECTION TIME = %ld.%ld[ms]\n\n"
+				, start_cnt+1, end_cnt, (unsigned long)t
+				, msec_rem);
+		}
+
+		if ((end_cnt) == (start_cnt + 1)) {
+			ret = show_cpu_load_freq_sub((int)end_cnt+2
+								, 5, buf, ret);
+			ret +=  snprintf(buf + ret, PAGE_SIZE - ret, "\n\n");
+		}
+
+		ret +=  snprintf(buf + ret, PAGE_SIZE - ret,
+			"#############################"
+			" CPU %d #############################\n", i);
+
+		if (cpu_task_history_show_select_cpu == -1)
+			ret = view_list(buf, ret);
+		else if (i == cpu_task_history_show_select_cpu)
+			ret = view_list(buf, ret);
+
+		if (ret < PAGE_SIZE - 1)
+			ret +=  snprintf(buf + ret, PAGE_SIZE - ret, "\n\n");
+	}
+
+	buf_size = strlen(buf);
+
+	return buf_size;
+}
+
+static ssize_t store_check_running_detail(struct kobject *a,
+			struct attribute *b, const char *buf, size_t count)
+{
+	return count;
+}
+
+static ssize_t show_check_running_detail(struct kobject *kobj,
+				struct attribute *attr, char *buf)
+{
+	unsigned int i;
+	unsigned int start_cnt = cpu_task_history_show_start_cnt;
+	unsigned int end_cnt = cpu_task_history_show_end_cnt;
+
+	for (i = 0; i < CPU_NUM; i++) {
+		pr_emerg("#############################"
+			   " CPU %d #############################\n", i);
+		process_sched_time_view(i, start_cnt, end_cnt);
+	}
+	return 0;
 }
 #endif
 
+enum {
+	ANDROID,
+	SLP,
+};
+
+static unsigned int cpu_hotplug_policy;
+static ssize_t store_hotplug_policy(struct kobject *a,
+			struct attribute *b, const char *buf, size_t count)
+{
+
+	if (strncmp(buf, "android", 7) == 0) {
+		if (cpu_hotplug_policy != ANDROID) {
+			cpu_hotplug_policy = ANDROID;
+			start_rq_work();
+		}
+
+	} else if (strncmp(buf, "slp", 3) == 0) {
+		if (cpu_hotplug_policy != SLP) {
+			cpu_hotplug_policy = SLP;
+			stop_rq_work();
+		}
+	}
+
+	return count;
+}
+
+static ssize_t show_hotplug_policy(struct kobject *kobj,
+				struct attribute *attr, char *buf)
+{
+	unsigned int ret = 0;
+
+	if (cpu_hotplug_policy == ANDROID)
+		ret +=  snprintf(buf + ret, PAGE_SIZE - ret, "android\n");
+	else if (cpu_hotplug_policy == SLP)
+		ret +=  snprintf(buf + ret, PAGE_SIZE - ret, "slp\n");
+	else
+		ret +=  snprintf(buf + ret, PAGE_SIZE - ret
+				, "[ERROR] unknown policy\n");
+
+	return ret;
+}
+
+
 /******************************************************************************/
 
+#ifdef CONFIG_SLP_GOV_DYNAMIC_PARAMS
+
+int  block_cpu_off(int online)
+{
+	int ret = 0;
+
+	/* If Dynamic Params is enabled, We should pass down work
+	   when online cpu is bigger than params_min_cpu value */
+	if ((dbs_tuners_ins.dynamic_params != 0) &&
+		(dbs_tuners_ins.params_min_cpu != 0)) {
+
+		if (online > dbs_tuners_ins.params_min_cpu) {
+			pr_debug("%s online is bigger than min_cpu "
+				"online %d min_cpu %d\n", __func__,
+				online, dbs_tuners_ins.params_min_cpu);
+		} else {
+			pr_debug("%s online is smaller or equal with min_cpu "
+				"online %d min_cpu %d\n", __func__,
+				online, dbs_tuners_ins.params_min_cpu);
+			dbs_tuners_ins.params_stat_min_cpu++;
+			ret = 1;
+		}
+	}
+
+	return ret;
+
+}
+
+static ssize_t store_gov_dynamic_params_enable(struct kobject *a,
+			struct attribute *b, const char *buf, size_t count)
+{
+	int value;
+	struct cpu_dbs_info_s *dbs_info;
+	dbs_info = &per_cpu(od_cpu_dbs_info, 0);
+
+	sscanf(buf, "%d", &value);
+	mutex_lock(&dbs_info->params_mutex);
+	if (value > 0) {
+		dbs_tuners_ins.dynamic_params = 1;
+
+		dbs_tuners_ins.params_stat_min_freq = 0;
+		dbs_tuners_ins.params_stat_min_cpu = 0;
+	} else
+		dbs_tuners_ins.dynamic_params = 0;
+	mutex_unlock(&dbs_info->params_mutex);
+	return count;
+}
+
+static ssize_t show_gov_dynamic_params_enable(struct kobject *kobj,
+				struct attribute *attr, char *buf)
+{
+	return snprintf(buf, PAGE_SIZE, "%s\n",
+		dbs_tuners_ins.dynamic_params ? "enabled" :	"disabled");
+}
+
+static int extract_gov_dynamic_params(struct cpu_dbs_info_s *dbs_info,
+			const char *buf)
+{
+	int i, j, ret = 0;
+	char *tmp = (char *)buf;
+	char *params_buf[3] = {"i", "f", "c"};
+
+	mutex_lock(&dbs_info->params_mutex);
+
+	if (dbs_tuners_ins.dynamic_params == 0) {
+		pr_err("dynamic params disabled now\n");
+		mutex_unlock(&dbs_info->params_mutex);
+		return -1;
+	}
+
+	/* Clear dynamic parameters */
+	dbs_tuners_ins.params_min_interval = 0;
+	dbs_tuners_ins.params_min_freq = 0;
+	dbs_tuners_ins.params_min_cpu = 0;
+
+	/* extract dynamic parameters from sysfs buffer */
+	for (i = 0; i < DYNAMIC_PARAMS_MAX; i++) {
+		tmp = strstr(buf, params_buf[i]);
+		if (tmp == NULL)
+			continue;
+
+		j = atoi(&tmp[2]);
+
+		switch (tmp[0]) {
+		case 'i':
+			/* Minimum interval should be bigger than 200 mSec */
+			if (j >= DYNAMIC_PARAMS_MIN_INTERVAL)
+				dbs_tuners_ins.params_min_interval = j;
+			 else
+				pr_err("Minimum interval is too short %d\n", j);
+			break;
+		case 'f':
+			/* Minimum frequency should be between 1.4G and 200M */
+			if ((j >= DYNAMIC_PARAMS_MIN_FREQ)
+				&& (j <= DYNAMIC_PARAMS_MAX_FREQ))
+				dbs_tuners_ins.params_min_freq = j;
+			else
+				pr_err("Minimum frequency is too low"
+							" or high %d\n", j);
+			break;
+		case 'c':
+			/* Minimum running CPU should be between 1 and 4 */
+			if ((j >= DYNAMIC_PARAMS_MIN_CPU)
+				&& (j <= DYNAMIC_PARAMS_MAX_CPU))
+				dbs_tuners_ins.params_min_cpu = j;
+			 else
+				pr_err("Minimum run cpu is too small"
+							" or a lot %d\n", j);
+			break;
+		default:
+			pr_err("default\n");
+			break;
+		}
+	}
+
+	if ((dbs_tuners_ins.params_min_interval == 0) ||
+		(dbs_tuners_ins.params_min_freq == 0) ||
+		(dbs_tuners_ins.params_min_cpu == 0)) {
+		pr_err("%s error : dynamic parameters should be setting with "
+			"some value i=%d, f=%d, c=%d\n"
+			, __func__, dbs_tuners_ins.params_min_interval
+			, dbs_tuners_ins.params_min_freq
+			, dbs_tuners_ins.params_min_cpu);
+		dbs_tuners_ins.params_min_interval = 0;
+		dbs_tuners_ins.params_min_freq = 0;
+		dbs_tuners_ins.params_min_cpu = 0;
+		ret = -1;
+	}
+
+	mutex_unlock(&dbs_info->params_mutex);
+
+	return ret;
+}
+
+static ssize_t store_gov_dynamic_params(struct kobject *a,
+			struct attribute *b, const char *buf, size_t count)
+{
+	int ret, delay;
+	struct cpu_dbs_info_s *dbs_info;
+	dbs_info = &per_cpu(od_cpu_dbs_info, 0);
+
+	ret = extract_gov_dynamic_params(dbs_info, buf);
+	if (ret < 0) {
+		pr_err("%s error : return error value from extract_gov_dynamic_params\n"
+			, __func__);
+		return count;
+	}
+
+	delay = usecs_to_jiffies(dbs_tuners_ins.params_min_interval);
+	pr_err("delay  %d\n", delay);
+	queue_delayed_work_on(0, dynamic_params_workqueue
+					, &dbs_info->params_work, delay);
+	return count;
+}
+
+static ssize_t show_gov_dynamic_params(struct kobject *kobj,
+				struct attribute *attr, char *buf)
+{
+	unsigned int ret = 0;
+
+	ret +=  snprintf(buf, PAGE_SIZE
+			, "%16s\t%10d\n%16s\t%10d\n\%16s\t%10d\n"
+			, "Interval [us]   ", dbs_tuners_ins.params_min_interval
+			, "min-Freq [KHz]  ", dbs_tuners_ins.params_min_freq
+			, "min-CPU  [Units]", dbs_tuners_ins.params_min_cpu);
+
+	return ret;
+}
+
+static ssize_t store_gov_dynamic_params_stat(struct kobject *a,
+			struct attribute *b, const char *buf, size_t count)
+{
+	return count;
+}
+
+static ssize_t show_gov_dynamic_params_stat(struct kobject *kobj,
+				struct attribute *attr, char *buf)
+{
+	unsigned int ret = 0;
+		dbs_tuners_ins.params_stat_min_freq = 0;
+		dbs_tuners_ins.params_stat_min_cpu = 0;
+
+	ret +=  snprintf(buf, PAGE_SIZE
+			, "%16s\t%10d\n%16s\t%10d\n"
+			, "min freq. hit  "
+			, dbs_tuners_ins.params_stat_min_freq
+			, "min cpu   hit  "
+			, dbs_tuners_ins.params_stat_min_cpu);
+
+	return ret;
+}
+
+
+
+#endif /* CONFIG_SLP_GOV_DYNAMIC_PARAMS */
 
 define_one_global_rw(sampling_rate);
 define_one_global_rw(io_is_busy);
@@ -908,7 +1701,15 @@ define_one_global_rw(hotplug_lock);
 define_one_global_rw(dvfs_debug);
 #ifdef CONFIG_SLP_CHECK_CPU_LOAD
 define_one_global_rw(cpu_load_freq);
+define_one_global_rw(check_running);
+define_one_global_rw(check_running_detail);
 #endif
+define_one_global_rw(hotplug_policy);
+#ifdef CONFIG_SLP_GOV_DYNAMIC_PARAMS
+define_one_global_rw(gov_dynamic_params_enable);
+define_one_global_rw(gov_dynamic_params);
+define_one_global_rw(gov_dynamic_params_stat);
+#endif /* CONFIG_SLP_GOV_DYNAMIC_PARAMS */
 
 static struct attribute *dbs_attributes[] = {
 	&sampling_rate_min.attr,
@@ -932,7 +1733,15 @@ static struct attribute *dbs_attributes[] = {
 	&dvfs_debug.attr,
 #ifdef CONFIG_SLP_CHECK_CPU_LOAD
 	&cpu_load_freq.attr,
+	&check_running.attr,
+	&check_running_detail.attr,
 #endif
+	&hotplug_policy.attr,
+#ifdef CONFIG_SLP_GOV_DYNAMIC_PARAMS
+	&gov_dynamic_params_enable.attr,
+	&gov_dynamic_params.attr,
+	&gov_dynamic_params_stat.attr,
+#endif /* CONFIG_SLP_GOV_DYNAMIC_PARAMS */
 	&hotplug_freq_1_1.attr,
 	&hotplug_freq_2_0.attr,
 	&hotplug_freq_2_1.attr,
@@ -954,6 +1763,25 @@ static struct attribute_group dbs_attr_group = {
 };
 
 /************************** sysfs end ************************/
+
+int get_cpu_load(unsigned int cpu, unsigned int nr_check)
+{
+	int cur_cnt, i, sum = 0, ret;
+
+	cur_cnt = cpu_load_freq_history_cnt;
+
+	for (i = 0; i < nr_check; i++) {
+		sum += cpu_load_freq_history[cur_cnt].cpu_load[cpu];
+		cur_cnt = get_index(cur_cnt, CPU_LOAD_HISTORY_NUM, -1);
+	}
+
+	if (nr_check != 0)
+		ret = sum / nr_check;
+	else
+		ret = -1;
+
+	return ret;
+}
 
 static void cpu_up_work(struct work_struct *work)
 {
@@ -1102,6 +1930,25 @@ static int check_down(void)
 	down_freq = hotplug_freq[online - 1][HOTPLUG_DOWN_INDEX];
 	down_rq = hotplug_rq[online - 1][HOTPLUG_DOWN_INDEX];
 
+#ifdef CONFIG_SLP_GOV_DYNAMIC_PARAMS
+	/* If Dynamic Params is enabled, We should pass down work
+	   when online cpu is bigger than params_min_cpu value */
+	if ((dbs_tuners_ins.dynamic_params != 0) &&
+		(dbs_tuners_ins.params_min_cpu != 0)) {
+
+		if (online > dbs_tuners_ins.params_min_cpu) {
+			pr_debug("%s online is bigger than min_cpu "
+					"online %d min_cpu %d\n", __func__,
+					online, dbs_tuners_ins.params_min_cpu);
+		} else {
+			pr_debug("%s online is smaller or equal with min_cpu "
+					"online %d min_cpu %d\n", __func__,
+					online, dbs_tuners_ins.params_min_cpu);
+			dbs_tuners_ins.params_stat_min_cpu++;
+			return 0;
+		}
+	}
+#endif
 	if (online == 1)
 		return 0;
 
@@ -1139,6 +1986,192 @@ static int check_down(void)
 	return 0;
 }
 
+
+/******************** HOT PLUG ******************************************/
+
+#define MAX_CPU_FREQ 1400000
+#define NUM_CPUS 4
+
+
+
+enum {
+	DOWN,
+	UP,
+};
+enum {
+	NORMAL,
+	NOT_OFF,
+};
+
+enum {
+	UP_THRESHOLD,
+	DOWN_THRESHOLD,
+};
+
+enum {
+	NEED_TO_TRUN_ON_CPU,
+	NEED_TO_TRUN_OFF_CPU,
+	LEAVE_CPU,
+};
+
+#define CPU_THRESHOLD_RATIO (0.8)
+
+static unsigned int cpu_threshold_level[][2] = {
+	{MAX_CPU_FREQ * CPU_THRESHOLD_RATIO,  (-1) },
+	{MAX_CPU_FREQ * CPU_THRESHOLD_RATIO, 200000},
+	{MAX_CPU_FREQ * CPU_THRESHOLD_RATIO, 300000},
+	{ (-1)      , 400000 },
+
+};
+
+static unsigned int num_online_cpu;
+static unsigned int num_running_task;
+static unsigned int min_load_freq;
+static unsigned int sum_load_freq;
+static unsigned int max_free_load_freq;
+static unsigned int avg_load_freq;
+
+static void cpu_updown(unsigned int cpu_num, unsigned int up_down)
+{
+	if (up_down == UP) {
+		printk(KERN_ERR "cpu_up %d ", cpu_num);
+		cpu_up(cpu_num);
+	} else if (up_down == DOWN) {
+		printk(KERN_ERR "cpu_down %d ", cpu_num);
+		cpu_down(cpu_num);
+	}
+}
+
+static void cpu_mfl_hotplug_work(struct work_struct *work)
+{
+	int i;
+	int need_condition = LEAVE_CPU;
+
+	unsigned int turn_on_cpu = 0, turn_off_cpu = 0;
+	unsigned int cpu_on_freq, cpu_off_freq;
+	static unsigned int cpu_on_freq_ctn_cnt, cpu_off_freq_ctn_cnt;
+
+	struct cpu_dbs_info_s *dbs_info =
+		container_of(work, struct cpu_dbs_info_s, mfl_hotplug_work);
+
+	unsigned int freq_new = dbs_info->cpufreq_new;
+
+	int hotplug_lock = atomic_read(&g_hotplug_lock);
+	if (hotplug_lock > 0)
+		return;
+
+	num_online_cpu = num_online_cpus();
+	num_running_task = nr_running();
+	max_free_load_freq = (MAX_CPU_FREQ * 100)  - min_load_freq;
+	avg_load_freq = sum_load_freq / num_online_cpu;
+	cpu_on_freq = cpu_threshold_level[num_online_cpu-1][UP_THRESHOLD];
+	cpu_off_freq =  cpu_threshold_level[num_online_cpu-1][DOWN_THRESHOLD];
+
+	if (freq_new >= cpu_on_freq)
+		cpu_on_freq_ctn_cnt++;
+	 else
+		cpu_on_freq_ctn_cnt = 0;
+
+	if (freq_new <= cpu_off_freq)
+		cpu_off_freq_ctn_cnt++;
+	else
+		cpu_off_freq_ctn_cnt = 0;
+
+	cpu_load_freq_history[cpu_load_freq_history_cnt].nr_run_avg
+						= num_running_task * 100;
+
+	/* CHECK CPU ON */
+	switch (num_online_cpu) {
+	case 1:
+		if ((num_running_task >= 2) && (cpu_on_freq_ctn_cnt >= 2))
+			need_condition = NEED_TO_TRUN_ON_CPU;
+		break;
+	case 2:
+		if ((num_running_task >= 3) && (cpu_on_freq_ctn_cnt >= 3)) {
+			if (max_free_load_freq < (MAX_CPU_FREQ * 50))
+				need_condition = NEED_TO_TRUN_ON_CPU;
+		}
+		break;
+	case 3:
+		if ((num_running_task >= 4) && (cpu_on_freq_ctn_cnt >= 4))  {
+			if (max_free_load_freq < (MAX_CPU_FREQ * 50))
+				need_condition = NEED_TO_TRUN_ON_CPU;
+		}
+		break;
+	}
+
+	/* CHECK CPU OFF */
+	switch (num_online_cpu) {
+	case 2:
+		if ((cpu_off_freq_ctn_cnt >= 3)
+			&& (avg_load_freq < (MAX_CPU_FREQ * 20)))
+				need_condition = NEED_TO_TRUN_OFF_CPU;
+		break;
+	case 3:
+		if ((cpu_off_freq_ctn_cnt >= 2)
+			&& (avg_load_freq < (MAX_CPU_FREQ * 30)))
+			need_condition = NEED_TO_TRUN_OFF_CPU;
+
+		break;
+	case 4:
+		if ((cpu_off_freq_ctn_cnt >= 2)
+			&& (avg_load_freq < (MAX_CPU_FREQ * 40)))
+			need_condition = NEED_TO_TRUN_OFF_CPU;
+		break;
+	}
+
+
+	if ((need_condition == NEED_TO_TRUN_ON_CPU) \
+		|| (need_condition == NEED_TO_TRUN_OFF_CPU)) {
+		cpu_on_freq_ctn_cnt = 0;
+
+		if (need_condition == NEED_TO_TRUN_ON_CPU) {
+			for (i = NUM_CPUS-1; i > 0; --i) {
+				if (cpu_online(i) == 0) {
+					turn_on_cpu = i;
+					break;
+				}
+			}
+			cpu_updown(turn_on_cpu, UP);
+		} else if (need_condition == NEED_TO_TRUN_OFF_CPU) {
+			for (i  = 1; i <=  NUM_CPUS - 1; ++i) {
+				#if defined(CONFIG_SLP_ADAPTIVE_HOTPLUG)
+					if ((num_online_cpu == 4)
+							&& (i == 1)) {
+						int cpu1_load, cpu2_load;
+						cpu1_load = get_cpu_load(1, 5);
+						cpu2_load = get_cpu_load(2, 5);
+						if (cpu1_load > cpu2_load)
+							i = 2;
+					}
+				#endif
+				if (cpu_online(i) == 1) {
+					turn_off_cpu = i;
+					break;
+				}
+			}
+		#ifdef CONFIG_SLP_GOV_DYNAMIC_PARAMS
+			if (block_cpu_off(num_online_cpu) == 0)
+		#endif
+				cpu_updown(turn_off_cpu, DOWN);
+		}
+	}
+
+}
+
+
+static void check_mfl_hotplug_work(struct cpu_dbs_info_s *this_dbs_info
+			, unsigned int old_freq, unsigned int new_freq)
+{
+	this_dbs_info->cpufreq_old = old_freq;
+	this_dbs_info->cpufreq_new = new_freq;
+
+	queue_work_on(this_dbs_info->cpu, dvfs_workqueue,
+				      &this_dbs_info->mfl_hotplug_work);
+
+}
+/****************************************************************/
+
 static void dbs_check_cpu(struct cpu_dbs_info_s *this_dbs_info)
 {
 	unsigned int max_load_freq;
@@ -1149,23 +2182,36 @@ static void dbs_check_cpu(struct cpu_dbs_info_s *this_dbs_info)
 	int max_hotplug_rate = max(dbs_tuners_ins.cpu_up_rate,
 				   dbs_tuners_ins.cpu_down_rate);
 	int up_threshold = dbs_tuners_ins.up_threshold;
+	unsigned int nr_run_avg = 0;
+	unsigned int old_freq, new_freq;
+
 
 #ifdef CONFIG_SLP_CHECK_CPU_LOAD
-	unsigned int cpu_load[NR_CPUS];
+	unsigned int cpu_load[CPU_NUM];
 #endif
 	policy = this_dbs_info->cur_policy;
 
 	hotplug_history->usage[num_hist].freq = policy->cur;
-	hotplug_history->usage[num_hist].rq_avg = get_nr_run_avg();
+
+	if (cpu_hotplug_policy == ANDROID)
+		nr_run_avg = get_nr_run_avg();
+
+	hotplug_history->usage[num_hist].rq_avg = nr_run_avg;
 	++hotplug_history->num_hist;
 
 	/* Get Absolute Load - in terms of freq */
 	max_load_freq = 0;
 
 #ifdef CONFIG_SLP_CHECK_CPU_LOAD
-	for (j = 0; j < NR_CPUS; j++)
+	for (j = 0; j < CPU_NUM; j++)
 		cpu_load[j] = 0;
 #endif
+
+	min_load_freq =  (unsigned int)(-1);
+	sum_load_freq = 0;
+
+	old_freq = policy->cur;
+	new_freq = policy->cur;
 
 	for_each_cpu(j, policy->cpus) {
 		struct cpu_dbs_info_s *j_dbs_info;
@@ -1232,19 +2278,29 @@ static void dbs_check_cpu(struct cpu_dbs_info_s *this_dbs_info)
 		load_freq = load * freq_avg;
 		if (load_freq > max_load_freq)
 			max_load_freq = load_freq;
+
+		if (cpu_hotplug_policy == SLP) {
+			if (cpu_active(j) == 1) {
+				if (load_freq < min_load_freq)
+					min_load_freq = load_freq;
+			}
+			sum_load_freq += load_freq;
+		}
 	}
 
 #ifdef CONFIG_SLP_CHECK_CPU_LOAD
-	store_cpu_load(policy->cur, cpu_load);
+	store_cpu_load(policy->cur, cpu_load, nr_run_avg);
 #endif
 
 	/* Check for CPU hotplug */
-	if (check_up()) {
-		queue_work_on(this_dbs_info->cpu, dvfs_workqueue,
-			      &this_dbs_info->up_work);
-	} else if (check_down()) {
-		queue_work_on(this_dbs_info->cpu, dvfs_workqueue,
-			      &this_dbs_info->down_work);
+	if (cpu_hotplug_policy == ANDROID) {
+		if (check_up()) {
+			queue_work_on(this_dbs_info->cpu, dvfs_workqueue,
+				      &this_dbs_info->up_work);
+		} else if (check_down()) {
+			queue_work_on(this_dbs_info->cpu, dvfs_workqueue,
+				      &this_dbs_info->down_work);
+		}
 	}
 	if (hotplug_history->num_hist  == max_hotplug_rate)
 		hotplug_history->num_hist = 0;
@@ -1260,6 +2316,13 @@ static void dbs_check_cpu(struct cpu_dbs_info_s *this_dbs_info)
 		if (policy->cur < policy->max && target == policy->max)
 			this_dbs_info->rate_mult =
 				dbs_tuners_ins.sampling_down_factor;
+
+		if (cpu_hotplug_policy == SLP) {
+			new_freq = target;
+			check_mfl_hotplug_work(this_dbs_info
+						, old_freq , new_freq);
+		}
+
 		dbs_freq_increase(policy, target);
 		return;
 	}
@@ -1301,12 +2364,43 @@ static void dbs_check_cpu(struct cpu_dbs_info_s *this_dbs_info)
 			&& (max_load_freq / freq_next) > down_thres)
 			freq_next = FREQ_FOR_RESPONSIVENESS;
 
-		if (policy->cur == freq_next)
-			return;
+		if (cpu_hotplug_policy == SLP)
+			new_freq = freq_next;
 
+		if (policy->cur == freq_next) {
+			if (cpu_hotplug_policy == SLP) {
+				check_mfl_hotplug_work(this_dbs_info
+							, old_freq , new_freq);
+			}
+			return;
+		}
+
+#ifdef CONFIG_SLP_GOV_DYNAMIC_PARAMS
+	/* If Dynamic Params is enabled, We should return frequency
+	   changing function, when freq_next is bigger than
+	   params_min_freq value */
+		if ((dbs_tuners_ins.dynamic_params != 0)
+		&& (dbs_tuners_ins.params_min_freq != 0)) {
+			if (freq_next > dbs_tuners_ins.params_min_freq) {
+				pr_debug("%s freq_next is bigger than min_freq "
+				"freq_next %d min_freq %d\n", __func__,
+				freq_next, dbs_tuners_ins.params_min_freq);
+			} else {
+				pr_debug("%s freq_next is smaller or equal with min_freq "
+				"freq_next %d min_freq %d\n", __func__,
+				freq_next, dbs_tuners_ins.params_min_cpu);
+				dbs_tuners_ins.params_stat_min_freq++;
+				return;
+			}
+	}
+#endif
 		__cpufreq_driver_target(policy, freq_next,
 					CPUFREQ_RELATION_L);
 	}
+
+	if (cpu_hotplug_policy == SLP)
+		check_mfl_hotplug_work(this_dbs_info, old_freq , new_freq);
+
 }
 
 static void do_dbs_timer(struct work_struct *work)
@@ -1347,6 +2441,7 @@ static inline void dbs_timer_init(struct cpu_dbs_info_s *dbs_info)
 	INIT_DELAYED_WORK_DEFERRABLE(&dbs_info->work, do_dbs_timer);
 	INIT_WORK(&dbs_info->up_work, cpu_up_work);
 	INIT_WORK(&dbs_info->down_work, cpu_down_work);
+	INIT_WORK(&dbs_info->mfl_hotplug_work, cpu_mfl_hotplug_work);
 
 	queue_delayed_work_on(dbs_info->cpu, dvfs_workqueue,
 			      &dbs_info->work, delay + 2 * HZ);
@@ -1358,6 +2453,33 @@ static inline void dbs_timer_exit(struct cpu_dbs_info_s *dbs_info)
 	cancel_work_sync(&dbs_info->up_work);
 	cancel_work_sync(&dbs_info->down_work);
 }
+
+#ifdef CONFIG_SLP_GOV_DYNAMIC_PARAMS
+static void dynamic_params_work(struct work_struct *work)
+{
+	struct cpu_dbs_info_s *dbs_info =
+		container_of(work, struct cpu_dbs_info_s, params_work.work);
+
+	mutex_lock(&dbs_info->params_mutex);
+	dbs_tuners_ins.params_min_interval = 0;
+	dbs_tuners_ins.params_min_freq = 0;
+	dbs_tuners_ins.params_min_cpu = 0;
+	pr_debug("%s dynamic params work called\n", __func__);
+	mutex_unlock(&dbs_info->params_mutex);
+}
+
+static inline void gov_dynamic_params_timer_init
+				(struct cpu_dbs_info_s *dbs_info)
+{
+	INIT_DELAYED_WORK(&dbs_info->params_work, dynamic_params_work);
+}
+
+static inline void gov_dynamic_params_timer_exit
+				(struct cpu_dbs_info_s *dbs_info)
+{
+	cancel_delayed_work_sync(&dbs_info->params_work);
+}
+#endif /* CONFIG_SLP_GOV_DYNAMIC_PARAMS */
 
 static int pm_notifier_call(struct notifier_block *this,
 			    unsigned long event, void *ptr)
@@ -1451,7 +2573,9 @@ static int cpufreq_governor_dbs(struct cpufreq_policy *policy,
 		dbs_tuners_ins.max_freq = policy->max;
 		dbs_tuners_ins.min_freq = policy->min;
 		hotplug_history->num_hist = 0;
-		start_rq_work();
+
+		if (cpu_hotplug_policy == ANDROID)
+			start_rq_work();
 
 		mutex_lock(&dbs_mutex);
 
@@ -1499,9 +2623,19 @@ static int cpufreq_governor_dbs(struct cpufreq_policy *policy,
 #ifdef CONFIG_HAS_EARLYSUSPEND
 		register_early_suspend(&early_suspend);
 #endif
+#ifdef CONFIG_SLP_GOV_DYNAMIC_PARAMS
+		mutex_init(&this_dbs_info->params_mutex);
+		gov_dynamic_params_timer_init(this_dbs_info);
+#endif /* CONFIG_SLP_GOV_DYNAMIC_PARAMS */
+
 		break;
 
 	case CPUFREQ_GOV_STOP:
+#ifdef CONFIG_SLP_GOV_DYNAMIC_PARAMS
+		gov_dynamic_params_timer_exit(this_dbs_info);
+		mutex_destroy(&this_dbs_info->params_mutex);
+#endif /* CONFIG_SLP_GOV_DYNAMIC_PARAMS */
+
 #ifdef CONFIG_HAS_EARLYSUSPEND
 		unregister_early_suspend(&early_suspend);
 #endif
@@ -1562,10 +2696,19 @@ static int __init cpufreq_gov_dbs_init(void)
 
 	dvfs_workqueue = create_workqueue("kslp");
 	if (!dvfs_workqueue) {
-		pr_err("%s cannot create workqueue\n", __func__);
+		pr_err("%s cannot create dvfs_workqueue\n", __func__);
 		ret = -ENOMEM;
-		goto err_queue;
+		goto err_dvfs_queue;
 	}
+
+#ifdef CONFIG_SLP_GOV_DYNAMIC_PARAMS
+	dynamic_params_workqueue = create_workqueue("slp_dynamic_params");
+	if (!dynamic_params_workqueue) {
+		pr_err("%s cannot create dynamic_params_workqueue\n", __func__);
+		ret = -ENOMEM;
+		goto err_dynamic_params;
+	}
+#endif /* CONFIG_SLP_GOV_DYNAMIC_PARAMS */
 
 	ret = cpufreq_register_governor(&cpufreq_gov_slp);
 	if (ret)
@@ -1580,8 +2723,12 @@ static int __init cpufreq_gov_dbs_init(void)
 	return ret;
 
 err_reg:
+#ifdef CONFIG_SLP_GOV_DYNAMIC_PARAMS
+	destroy_workqueue(dynamic_params_workqueue);
+err_dynamic_params:
+#endif /* CONFIG_SLP_GOV_DYNAMIC_PARAMS */
 	destroy_workqueue(dvfs_workqueue);
-err_queue:
+err_dvfs_queue:
 	kfree(hotplug_history);
 err_hist:
 	kfree(rq_data);
@@ -1591,6 +2738,9 @@ err_hist:
 static void __exit cpufreq_gov_dbs_exit(void)
 {
 	cpufreq_unregister_governor(&cpufreq_gov_slp);
+#ifdef CONFIG_SLP_GOV_DYNAMIC_PARAMS
+	destroy_workqueue(dynamic_params_workqueue);
+#endif /* CONFIG_SLP_GOV_DYNAMIC_PARAMS */
 	destroy_workqueue(dvfs_workqueue);
 	kfree(hotplug_history);
 	kfree(rq_data);

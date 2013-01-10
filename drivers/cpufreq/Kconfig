@@ -182,7 +182,7 @@ config CPU_FREQ_GOV_ONDEMAND
 
 config CPU_FREQ_GOV_ONDEMAND_FLEXRATE
 	bool "flexrate interface for 'ondemand' cpufreq policy governor"
-	depends on CPU_FREQ_GOV_ONDEMAND
+	depends on CPU_FREQ_GOV_ONDEMAND || CPU_FREQ_GOV_PEGASUSQ
 	help
 	  Flexrate for 'ondemand' governor provides an interface to request
 	  faster polling temporarily. This is to let it react quickly to
@@ -271,6 +271,10 @@ config CPU_FREQ_GOV_SLP
 
 config SLP_CHECK_CPU_LOAD
         bool "check load and frequency of cpu"
+	depends on CPU_FREQ_GOV_SLP
+
+config SLP_GOV_DYNAMIC_PARAMS
+        bool "check SLP GOV. Dynamic Params feature"
 	depends on CPU_FREQ_GOV_SLP
 
 config CPU_FREQ_DVFS_MONITOR
